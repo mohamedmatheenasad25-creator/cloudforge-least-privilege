@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Least-Privilege Access Demo</title>
+<style>
+  :root {
+    --bg: #0b1220; --panel: #111a2e; --panel2: #16213a; --line: #24345a;
+    --text: #e6ecf8; --muted: #93a3c7;
+    --ok: #34d399; --bad: #f87171; --warn: #fbbf24; --accent: #60a5fa;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body { font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; padding: 28px 16px 60px; }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 26px; margin: 0 0 4px; letter-spacing: -.01em; }
+  .sub { color: var(--muted); margin: 0 0 24px; }
+  .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); margin-bottom: 22px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; min-width: 0; }
+  .card h3 { margin: 0 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); font-weight: 600; }
+  .mono { font: 12.5px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; word-break: break-all; }
+  .small { color: var(--muted); font-size: 12.5px; margin-top: 4px; }
+  .bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+  button { font: inherit; cursor: pointer; border-radius: 9px; border: 1px solid var(--line); background: var(--panel2); color: var(--text); padding: 8px 14px; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .55; cursor: progress; }
+  button.primary { background: var(--accent); color: #07111f; border-color: var(--accent); font-weight: 600; }
+  #summary { font-weight: 600; }
+  .row { display: grid; grid-template-columns: 1fr auto; gap: 8px 16px; align-items: center;
+         background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px 16px; margin-bottom: 10px; }
+  .row .title { font-weight: 600; }
+  .tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+  .tag { font-size: 11.5px; padding: 1px 8px; border-radius: 99px; border: 1px solid var(--line); color: var(--muted); }
+  .result { grid-column: 1 / -1; display: none; border-top: 1px solid var(--line); padding-top: 8px; }
+  .result.show { display: block; }
+  .badge { display: inline-block; font-weight: 700; font-size: 12px; letter-spacing: .06em; padding: 2px 10px; border-radius: 6px; margin-right: 8px; }
+  .b-ALLOWED { background: rgba(52,211,153,.15); color: var(--ok); }
+  .b-DENIED  { background: rgba(248,113,113,.15); color: var(--bad); }
+  .b-ERROR   { background: rgba(251,191,36,.15); color: var(--warn); }
+  .match { font-size: 12.5px; }
+  .match.yes { color: var(--ok); } .match.no { color: var(--warn); }
+  .detail { margin-top: 6px; color: var(--muted); }
+  details { margin-top: 22px; }
+  summary { cursor: pointer; color: var(--accent); }
+  pre { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; overflow: auto; font-size: 12.5px; }
+  #err { color: var(--bad); margin: 10px 0; display: none; }
+  footer { margin-top: 30px; color: var(--muted); font-size: 12.5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Least-Privilege Access Demo</h1>
+  <p class="sub">A restricted cloud identity gets only the permissions its task needs. Every button below makes a real AWS call using temporary credentials and shows what AWS decided.</p>
+
+  <div class="grid">
+    <div class="card"><h3>Backend identity</h3><div class="mono" id="backend">loading…</div><div class="small">Can only assume the restricted role. No admin rights.</div></div>
+    <div class="card"><h3>Restricted identity</h3><div class="mono" id="restricted">not used yet</div><div class="small" id="expiry">Temporary credentials are issued on the first test.</div></div>
+    <div class="card"><h3>Test resource</h3><div class="mono" id="bucket">loading…</div><div class="small" id="region"></div></div>
+  </div>
+
+  <div id="err"></div>
+
+  <div class="bar">
+    <button class="primary" id="runAll">Run all tests</button>
+    <button id="dl" disabled>Download evidence (JSON)</button>
+    <span id="summary"></span>
+  </div>
+
+  <div id="rows"></div>
+
+  <details id="pol">
+    <summary>Show the restricted role's permission policy</summary>
+    <pre id="polText">loading…</pre>
+  </details>
+
+  <footer>Credentials used here are issued by AWS STS and expire after 15 minutes. No access keys are stored anywhere.</footer>
+</div>
+
+<script>
+(function () {
+  var rowsEl = document.getElementById('rows');
+  var errEl = document.getElementById('err');
+  var runAllBtn = document.getElementById('runAll');
+  var dlBtn = document.getElementById('dl');
+  var summaryEl = document.getElementById('summary');
+  var results = {};
+  var lastMeta = {};
+  var info = null;
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+  function showErr(msg) { errEl.textContent = msg; errEl.style.display = msg ? 'block' : 'none'; }
+
+  function api(path, body) {
+    var opts = body === undefined ? {} : {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+    };
+    return fetch(path, opts).then(function (r) {
+      return r.json().then(function (j) {
+        if (!r.ok) throw new Error(j.error || r.statusText);
+        return j;
+      });
+    });
+  }
+
+  function buildRows() {
+    info.actions.forEach(function (a) {
+      var row = el('div', 'row');
+      var left = el('div');
+      left.appendChild(el('div', 'title', a.label));
+      var tags = el('div', 'tags');
+      tags.appendChild(el('span', 'tag', a.kind));
+      tags.appendChild(el('span', 'tag', a.api));
+      tags.appendChild(el('span', 'tag', 'Expected: ' + a.expected));
+      left.appendChild(tags);
+      var btn = el('button', '', 'Run');
+      btn.addEventListener('click', function () { runOne(a.id, btn); });
+      var res = el('div', 'result');
+      res.id = 'res-' + a.id;
+      row.appendChild(left); row.appendChild(btn); row.appendChild(res);
+      rowsEl.appendChild(row);
+    });
+  }
+
+  function showResult(r) {
+    results[r.id] = r;
+    var box = document.getElementById('res-' + r.id);
+    box.textContent = '';
+    var head = el('div');
+    head.appendChild(el('span', 'badge b-' + r.outcome, r.outcome));
+    head.appendChild(el('span', 'match ' + (r.as_expected ? 'yes' : 'no'),
+      r.as_expected ? 'As expected' : 'Not what was expected'));
+    box.appendChild(head);
+    box.appendChild(el('div', 'detail mono', r.detail));
+    box.classList.add('show');
+    dlBtn.disabled = false;
+    updateSummary();
+  }
+
+  function updateSummary() {
+    var ids = Object.keys(results);
+    if (!ids.length) { summaryEl.textContent = ''; return; }
+    var good = ids.filter(function (k) { return results[k].as_expected; }).length;
+    summaryEl.textContent = good + ' of ' + ids.length + ' behaved as expected';
+    summaryEl.style.color = good === ids.length ? 'var(--ok)' : 'var(--warn)';
+  }
+
+  function setMeta(m) {
+    lastMeta = { restricted_identity: m.restricted_identity, credentials_expire: m.credentials_expire };
+    document.getElementById('restricted').textContent = m.restricted_identity;
+    document.getElementById('expiry').textContent =
+      'Temporary credentials, expire ' + new Date(m.credentials_expire).toLocaleTimeString();
+  }
+
+  function runOne(id, btn) {
+    showErr(''); btn.disabled = true;
+    api('/api/run', { action: id }).then(function (j) { setMeta(j); showResult(j.result); })
+      .catch(function (e) { showErr('Request failed: ' + e.message); })
+      .then(function () { btn.disabled = false; });
+  }
+
+  runAllBtn.addEventListener('click', function () {
+    showErr(''); runAllBtn.disabled = true; runAllBtn.textContent = 'Running…';
+    api('/api/run-all', {}).then(function (j) { setMeta(j); j.results.forEach(showResult); })
+      .catch(function (e) { showErr('Request failed: ' + e.message); })
+      .then(function () { runAllBtn.disabled = false; runAllBtn.textContent = 'Run all tests'; });
+  });
+
+  dlBtn.addEventListener('click', function () {
+    var doc = {
+      generated_at: new Date().toISOString(),
+      backend_identity: info.backend_identity,
+      restricted_role: info.tester_role,
+      bucket: info.bucket,
+      region: info.region,
+      session: lastMeta,
+      results: info.actions.map(function (a) { return results[a.id]; }).filter(Boolean)
+    };
+    var url = URL.createObjectURL(new Blob([JSON.stringify(doc, null, 2)], { type: 'application/json' }));
+    var a = document.createElement('a');
+    a.href = url; a.download = 'least-privilege-evidence.json';
+    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+  });
+
+  api('/api/info').then(function (j) {
+    info = j;
+    document.getElementById('backend').textContent = j.backend_identity;
+    document.getElementById('bucket').textContent = j.bucket;
+    document.getElementById('region').textContent = 'Region ' + j.region + ' | restricted role: ' + j.tester_role.split('/').pop();
+    buildRows();
+  }).catch(function (e) { showErr('Could not load backend info: ' + e.message); });
+
+  api('/api/policy').then(function (j) {
+    document.getElementById('polText').textContent = JSON.stringify(j.document || j, null, 2);
+  }).catch(function (e) { document.getElementById('polText').textContent = 'Unavailable: ' + e.message; });
+})();
+</script>
+</body>
+</html>
